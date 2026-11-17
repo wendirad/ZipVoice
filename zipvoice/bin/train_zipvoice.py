@@ -122,6 +122,16 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--resume-checkpoint",
+        type=str,
+        default=None,
+        help="Continue training from this checkpoint: a checkpoint-<step>.pt "
+        "(continues mid-epoch, right after that step) or an epoch-<N>.pt "
+        "(continues with epoch N+1). Restores model, averaged model, optimizer, "
+        "scheduler, grad scaler and step count. Overrides --start-epoch.",
+    )
+
+    parser.add_argument(
         "--num-epochs",
         type=int,
         default=11,
@@ -369,6 +379,89 @@ def get_parser():
         "which is a text file with '{token}\t{token_id}' per line.",
     )
 
+    parser.add_argument(
+        "--wandb",
+        type=str2bool,
+        default=False,
+        help="Log to Weights & Biases: every TensorBoard scalar is mirrored, "
+        "and audio samples are logged at each validation if --sample-list is set.",
+    )
+
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="zipvoice",
+        help="W&B project name.",
+    )
+
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="W&B run name. Defaults to the exp dir name.",
+    )
+
+    parser.add_argument(
+        "--wandb-run-id",
+        type=str,
+        default=None,
+        help="Continue this existing W&B run (its id, e.g. 'a1b2c3d4') "
+        "instead of starting a new one.",
+    )
+
+    parser.add_argument(
+        "--sample-list",
+        type=str,
+        default=None,
+        help="TSV of samples synthesized at each validation and logged to W&B: "
+        "'{name}\t{prompt_text}\t{prompt_wav}\t{text}' per line.",
+    )
+
+    parser.add_argument(
+        "--hub-repo",
+        type=str,
+        default=None,
+        help="Hugging Face model repo to push checkpoints to. Unset: no push.",
+    )
+
+    parser.add_argument(
+        "--push-every-n",
+        type=int,
+        default=0,
+        help="Push a checkpoint every N iterations (a multiple of --save-every-n). "
+        "0 means every saved checkpoint.",
+    )
+
+    parser.add_argument(
+        "--hub-keep-last",
+        type=int,
+        default=5,
+        help="Keep only the newest N checkpoints on the hub (older ones are "
+        "deleted after each push). 0 keeps all.",
+    )
+
+    parser.add_argument(
+        "--hub-private",
+        type=str2bool,
+        default=False,
+        help="Create the hub repo as private (only when it does not exist yet).",
+    )
+
+    parser.add_argument(
+        "--sample-every-n",
+        type=int,
+        default=0,
+        help="Log W&B audio samples every N iterations (and at iteration 0). "
+        "0 means at each validation (every --save-every-n).",
+    )
+
+    parser.add_argument(
+        "--sample-num-step",
+        type=int,
+        default=16,
+        help="Sampling steps used for the W&B audio samples.",
+    )
+
     return parser
 
 
@@ -485,6 +578,10 @@ def compute_fbank_loss(
     return loss, info
 
 
+_WANDB_SAMPLES = None  # set in run() on rank 0 when --wandb and --sample-list
+_HUB_PUSHER = None  # set in run() on rank 0 when --hub-repo
+
+
 def train_one_epoch(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
@@ -584,6 +681,17 @@ def train_one_epoch(
                     tb_writer, "train/valid_", params.batch_idx_train
                 )
 
+        if (
+            rank == 0
+            and _WANDB_SAMPLES is not None
+            and not params.print_diagnostics
+            and params.batch_idx_train
+            % (params.sample_every_n or params.valid_interval)
+            == 0
+        ):
+            _WANDB_SAMPLES.log(model, params.batch_idx_train)
+            model.train()
+
         params.batch_idx_train += 1
 
         batch_size = len(batch["text"])
@@ -663,6 +771,8 @@ def train_one_epoch(
                 topk=params.keep_last_k,
                 rank=rank,
             )
+            if rank == 0 and _HUB_PUSHER is not None:
+                _HUB_PUSHER.maybe_push(params.batch_idx_train)
         if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
             break
         if params.batch_idx_train % 100 == 0 and params.use_fp16:
@@ -889,6 +999,22 @@ def run(rank, world_size, args):
     copyfile(src=params.token_file, dst=f"{params.exp_dir}/tokens.txt")
     setup_logger(f"{params.exp_dir}/log/log-train")
 
+    if params.wandb and rank == 0:
+        import wandb
+
+        args.tensorboard = True  # W&B scalars come from the TensorBoard sync
+        run = wandb.init(
+            project=params.wandb_project,
+            name=params.wandb_run_name or Path(params.exp_dir).name,
+            config={k: str(v) for k, v in params.items()},
+            sync_tensorboard=True,
+            id=params.wandb_run_id or None,
+            resume="must" if params.wandb_run_id else "allow",
+        )
+        logging.info(f"wandb run id: {run.id} ({run.url})")
+        wandb.define_metric("samples/step")
+        wandb.define_metric("samples/*", step_metric="samples/step")
+
     if args.tensorboard and rank == 0:
         tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
     else:
@@ -913,6 +1039,30 @@ def run(rank, world_size, args):
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
     params.update(tokenizer_config)
 
+    global _WANDB_SAMPLES, _HUB_PUSHER
+    if params.hub_repo and rank == 0:
+        from zipvoice.utils.hub_push import HubPusher
+
+        _HUB_PUSHER = HubPusher(
+            repo_id=params.hub_repo,
+            exp_dir=Path(params.exp_dir),
+            every_n=params.push_every_n or params.save_every_n,
+            save_every_n=params.save_every_n,
+            private=params.hub_private,
+            keep_last=params.hub_keep_last,
+        )
+
+    if params.wandb and params.sample_list and rank == 0:
+        from zipvoice.utils.wandb_samples import WandbSamples
+
+        _WANDB_SAMPLES = WandbSamples(
+            sample_list=params.sample_list,
+            tokenizer=tokenizer,
+            out_dir=Path(params.exp_dir) / "samples",
+            device=params.device,
+            num_step=params.sample_num_step,
+        )
+
     logging.info(params)
 
     logging.info("About to create model")
@@ -924,7 +1074,9 @@ def run(rank, world_size, args):
 
     if params.checkpoint is not None:
         logging.info(f"Loading pre-trained model from {params.checkpoint}")
-        _ = load_checkpoint(filename=params.checkpoint, model=model, strict=True)
+        from zipvoice.utils.vocab_grow import load_pretrained_grow_vocab
+
+        load_pretrained_grow_vocab(filename=params.checkpoint, model=model)
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of parameters : {num_param}")
 
@@ -934,7 +1086,31 @@ def run(rank, world_size, args):
         model_avg = copy.deepcopy(model).to(torch.float64)
 
     assert params.start_epoch > 0, params.start_epoch
-    if params.start_epoch > 1:
+    checkpoints = None
+    if params.resume_checkpoint:
+        logging.info(f"Resuming from {params.resume_checkpoint}")
+        checkpoints = load_checkpoint(
+            filename=params.resume_checkpoint,
+            model=model,
+            model_avg=model_avg,
+            strict=True,
+        )
+        for k in (
+            "best_train_epoch",
+            "best_valid_epoch",
+            "batch_idx_train",
+            "best_train_loss",
+            "best_valid_loss",
+        ):
+            params[k] = checkpoints[k]
+        # checkpoint-<step>.pt: same epoch, the sampler continues mid-epoch;
+        # epoch-<N>.pt: that epoch is complete, start the next one.
+        resume_mid_epoch = not Path(params.resume_checkpoint).name.startswith("epoch-")
+        params.start_epoch = checkpoints["cur_epoch"] + (0 if resume_mid_epoch else 1)
+        logging.info(
+            f"Resumed at iteration {params.batch_idx_train}, epoch {params.start_epoch}"
+        )
+    elif params.start_epoch > 1:
         checkpoints = resume_checkpoint(params=params, model=model, model_avg=model_avg)
 
     model = model.to(params.device)
@@ -963,7 +1139,7 @@ def run(rank, world_size, args):
 
     scaler = create_grad_scaler(enabled=params.use_fp16)
 
-    if params.start_epoch > 1 and checkpoints is not None:
+    if checkpoints is not None:
         # load state_dict for optimizers
         if "optimizer" in checkpoints:
             logging.info("Loading optimizer state dict")
@@ -1034,6 +1210,13 @@ def run(rank, world_size, args):
     dev_cuts = dev_cuts.map(_tokenize_text)
 
     train_dl = datamodule.train_dataloaders(train_cuts)
+    if (
+        params.resume_checkpoint
+        and resume_mid_epoch
+        and checkpoints.get("sampler") is not None
+    ):
+        # continue the epoch where the checkpoint was saved (same batches order)
+        train_dl.sampler.load_state_dict(checkpoints["sampler"])
 
     valid_dl = datamodule.dev_dataloaders(dev_cuts)
 
@@ -1104,6 +1287,14 @@ def run(rank, world_size, args):
                 copyfile(src=filename, dst=best_valid_filename)
 
     logging.info("Done!")
+
+    if _HUB_PUSHER is not None:
+        _HUB_PUSHER.finish()
+
+    if params.wandb and rank == 0:
+        import wandb
+
+        wandb.finish()
 
     if world_size > 1:
         torch.distributed.barrier()
